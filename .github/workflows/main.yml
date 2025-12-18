@@ -32,7 +32,7 @@ jobs:
           # ========================================================
           # 修改：使用固定密码 123321
           # ========================================================
-          $password = "Roger123."
+          $password = "Rogerhere123."
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
           # 创建用户并添加到管理员组
