@@ -1,0 +1,108 @@
+name: RDP Optimized
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # 【安全建议】不要设置 3600 (60小时)，GitHub 免费额度单次上限是 6 小时。
+    # 设置太长容易触发风控，建议改为 350 分钟（接近 6 小时）
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # 1. 允许远程桌面，禁用 NLA (为了兼容性)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
+          
+          # 2. 【关键优化】修改 RDP 压缩算法，强制使用 AVC444 (提高低带宽下的画质/速度平衡)
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fClientDisableAVC444" -Value 0 -PropertyType DWORD -Force -ErrorAction SilentlyContinue
+
+          # 3. 防火墙设置
+          # 删除旧规则
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # 【关键优化】同时开放 TCP 和 UDP。RDP 8.0+ 协议会尝试使用 UDP 传输画面，速度比纯 TCP 快。
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale-UDP" dir=in action=allow protocol=UDP localport=3389
+          
+          # 重启服务
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User
+        run: |
+          # (保持你原来的代码不变，这部分写得很好)
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = "123321"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          # 存入环境变量，方便后续调用，但注意日志脱敏
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          # 使用静默安装
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $installerPath = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process -FilePath $installerPath -ArgumentList "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection & Optimize Network
+        run: |
+          # 启动 Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-action-$env:GITHUB_RUN_ID --accept-routes
+          
+          # 等待 IP 分配
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          
+          # ========================================================
+          # 【核心优化：修改 MTU】
+          # GitHub Actions 的网络层层嵌套，默认 MTU (1280/1420) 容易导致包分片，
+          # 包分片在跨国高丢包环境下是致命的，会导致 RDP 黑屏或 0x104。
+          # 我们强制将其降到 1200，牺牲一点吞吐量换取极高的稳定性。
+          # ========================================================
+          Write-Host "Optimizing MTU..."
+          Get-NetAdapter | Where-Object InterfaceDescription -like "*Tailscale*" | ForEach-Object {
+              netsh interface ipv4 set subinterface $_.InterfaceIndex mtu=1200 store=persistent
+              Write-Host "Set MTU to 1200 for $($_.Name)"
+          }
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "========================================="
+          Write-Host "   RDP Ready! Connect Details:"
+          Write-Host "   IP: $env:TAILSCALE_IP"
+          Write-Host "   User: RDP"
+          Write-Host "   Password: $env:RDP_PASSWORD"
+          Write-Host "========================================="
+
+      - name: Keep Alive
+        run: |
+          # 简单的保活循环
+          while ($true) {
+              Start-Sleep -Seconds 300
+          }
